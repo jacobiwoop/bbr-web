@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Beach Buggy Racing</title>
+<meta name="description" content="Beach Buggy Racing (version Android d'origine) dans le navigateur">
+<meta name="theme-color" content="#0b2533">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icone.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icone-192.png">
+<style>
+  :root { --fond:#0b2533; --texte:#f2f7fa; --accent:#ffb43a; --barre:#24526b; }
+  html, body { margin:0; height:100%; background:var(--fond); color:var(--texte);
+               font:16px/1.5 system-ui, sans-serif; overflow:hidden; }
+  #accueil { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+             justify-content:center; gap:18px; padding:16px; text-align:center; }
+  h1 { margin:0; font-size:clamp(28px, 6vw, 52px); letter-spacing:.02em; }
+  #barre { width:min(420px, 100%); height:12px; background:var(--barre); border-radius:6px; overflow:hidden; }
+  #plein { height:100%; width:0; background:var(--accent); transition:width .2s; }
+  #texte { min-height:1.5em; opacity:.85; }
+  button { background:var(--accent); color:#222; border:0; border-radius:10px; padding:14px 40px;
+           font-size:20px; font-weight:800; cursor:pointer; }
+  button[hidden] { display:none; }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; display:none; background:#000;
+           touch-action:none; user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; outline:none; }
+  body.jeu canvas { display:block; }
+  body.jeu #accueil { display:none; }
+  #etat { position:fixed; left:0; bottom:0; width:100%; max-height:30vh; overflow:auto; margin:0;
+          padding:4px 8px; box-sizing:border-box; background:rgba(0,0,0,.6); white-space:pre-wrap;
+          font:12px/1.4 ui-monospace, monospace; pointer-events:none; display:none; }
+  body.journal #etat { display:block; }
+</style>
+</head>
+<body>
+<div id="accueil">
+  <h1>Beach Buggy Racing</h1>
+  <div id="barre"><div id="plein"></div></div>
+  <div id="texte">Chargement…</div>
+  <button id="jouer" hidden>Jouer</button>
+</div>
+<pre id="etat"></pre>
+<canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+<script>
+  // Paramètres d'URL (tests) : ?journal (affiche le journal), ?auto (lance sans clic),
+  // ?env=NOM=valeur,NOM2=valeur (variables de diagnostic : BBR_FPS=1, BBR_TRACE_SDL=1...)
+  const P = new URLSearchParams(location.search);
+  if (P.has('journal')) document.body.classList.add('journal');
+  const etat = document.getElementById('etat'), plein = document.getElementById('plein'),
+        texte = document.getElementById('texte'), jouer = document.getElementById('jouer');
+  const log = (t) => { etat.textContent = (etat.textContent + t + '\n').slice(-20000); etat.scrollTop = 1e9; console.log(t); };
+  if (!crossOriginIsolated) texte.textContent = 'Serveur sans COOP/COEP : le jeu ne peut pas démarrer.';
+
+  var Module = { canvas: document.getElementById('canvas'), print: log, printErr: log };
+
+  // Paquet du jeu (web/preparer_paquet.py, 89 Mo) : gardé dans le stockage permanent du navigateur
+  // (Cache API « bbr-paquet »). À chaque lancement, une requête HEAD compare sa date et sa taille à
+  // celles du serveur : identique -> lu depuis le disque, sinon retéléchargé ; hors ligne -> copie
+  // gardée. (Le cache HTTP ne le garde pas : entrée trop grosse.)
+  const CACHE_PAQUET = 'bbr-paquet';
+  async function lireAvecProgression(r, quoi) {
+    const total = +r.headers.get('Content-Length') || 0;
+    const morceaux = [];
+    let recu = 0;
+    for (const lecteur = r.body.getReader();;) {
+      const { done, value } = await lecteur.read();
+      if (done) break;
+      morceaux.push(value); recu += value.length;
+      if (total) plein.style.width = (100 * recu / total).toFixed(1) + '%';
+      texte.textContent = `${quoi}… ${(recu / 1e6).toFixed(0)}${total ? ' / ' + (total / 1e6).toFixed(0) : ''} Mo`;
+    }
+    const tout = new Uint8Array(recu);
+    let k = 0;
+    for (const m of morceaux) { tout.set(m, k); k += m.length; }
+    return tout;
+  }
+  async function telecharger(url) {
+    let cache = null, garde = null, serveur = null;
+    try { cache = await caches.open(CACHE_PAQUET); garde = await cache.match(url); } catch (e) { log('cache indisponible : ' + e); }
+    try { const h = await fetch(url, { method: 'HEAD', cache: 'no-store' }); if (h.ok) serveur = h; } catch (e) { /* hors ligne */ }
+    const version = r => r ? (r.headers.get('Last-Modified') || '') + '|' + (r.headers.get('Content-Length') || '') : '';
+    if (garde && (!serveur || version(garde) === version(serveur))) {
+      log('paquet du jeu : copie gardée dans le navigateur' + (serveur ? '' : ' (serveur injoignable)'));
+      return lireAvecProgression(garde, 'Lecture du jeu');
+    }
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`${url} : ${r.status}`);
+    const tout = await lireAvecProgression(r, garde ? 'Mise à jour du jeu' : 'Téléchargement du jeu');
+    if (cache) {
+      const entetes = { 'Content-Type': 'application/zip', 'Content-Length': String(tout.length),
+                        'Last-Modified': r.headers.get('Last-Modified') || '' };
+      cache.put(url, new Response(tout, { headers: entetes }))
+        .then(() => log('paquet du jeu : gardé dans le navigateur pour les prochains lancements'))
+        .catch(e => log('paquet du jeu non gardé : ' + e));
+    }
+    return tout;
+  }
+  // Demande que le stockage (paquet, sauvegarde) ne soit pas effacé quand le disque se remplit.
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist().then(ok => log('stockage permanent : ' + (ok ? 'accordé' : 'non accordé (le navigateur peut l\'effacer si le disque est plein)')));
+  // Application installable (PWA) : service worker = page et code du jeu disponibles hors ligne.
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(e => log('service worker : ' + e));
+
+  // Son : FMOD (fil de mixage du jeu) écrit des int16 dans un anneau en mémoire partagée
+  // (rt/jni.c, son_ecrire) ; cet AudioWorklet le lit sur le fil audio du navigateur.
+  const SON_WORKLET = `
+  class Anneau extends AudioWorkletProcessor {
+    constructor(o) { super(); const p = o.processorOptions;
+      this.d = new Int16Array(p.buf, p.ptr, p.n); this.n = p.n; this.ch = p.ch;
+      this.e = new Uint32Array(p.buf, p.pe, 1); this.l = new Uint32Array(p.buf, p.pl, 1); }
+    process(_, sorties) {
+      const o = sorties[0], f = o[0].length, ch = this.ch;
+      let l = Atomics.load(this.l, 0); const e = Atomics.load(this.e, 0);
+      const dispo = Math.floor(((e - l) >>> 0) / ch);
+      const k = Math.min(f, dispo);
+      for (let i = 0; i < k; i++) for (let c = 0; c < o.length; c++)
+        o[c][i] = this.d[(l + i * ch + Math.min(c, ch - 1)) % this.n] / 32768;
+      Atomics.store(this.l, 0, (l + k * ch) >>> 0);
+      return true;
+    }
+  }
+  registerProcessor('anneau', Anneau);`;
+  Module.sonDemarrer = async (buf, ptr, n, pe, pl, rc) => {
+    const rate = Math.floor(rc / 1000), ch = rc % 1000;
+    try {
+      const ctx = new AudioContext({ sampleRate: rate, latencyHint: 'interactive' });
+      await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([SON_WORKLET], { type: 'text/javascript' })));
+      const nd = new AudioWorkletNode(ctx, 'anneau', { numberOfInputs: 0, outputChannelCount: [2],
+        processorOptions: { buf, ptr, n, pe, pl, ch } });
+      nd.connect(ctx.destination);
+      const an = ctx.createAnalyser(); nd.connect(an);   // niveau sonore (diagnostic : Module.sonNiveau())
+      Module.sonNiveau = () => { const b = new Float32Array(an.fftSize); an.getFloatTimeDomainData(b); return Math.max(...b.map(Math.abs)); };
+      const reveil = () => { if (ctx.state !== 'running') ctx.resume(); };
+      reveil(); for (const t of ['pointerdown', 'keydown', 'touchstart']) addEventListener(t, reveil, true);
+      Module.son = ctx; log(`son : Web Audio ${rate} Hz, ${ch} voies (${ctx.state})`);
+    } catch (e) { log('son indisponible : ' + e); }
+  };
+
+  // Sauvegarde du joueur : le jeu écrit son profil dans /data/bbr_data (système de fichiers en
+  // mémoire, perdu au rechargement). On monte ce dossier sur IndexedDB (IDBFS) : rechargé avant le
+  // lancement, recopié dès qu'un fichier y change (vérification toutes les 2 s) et à la sortie.
+  const SAUVE = '/data/bbr_data';
+  const syncfs = (charger) => new Promise(ok => Module.FS.syncfs(charger, e => { if (e) log('sauvegarde : ' + e); ok(); }));
+  let empreinte = '';
+  const empreinteSauvegarde = () => { try { return Module.FS.readdir(SAUVE).filter(f => f[0] !== '.')
+      .map(f => { const s = Module.FS.stat(SAUVE + '/' + f); return f + ':' + s.size + ':' + (+s.mtime); }).join('|'); } catch (e) { return ''; } };
+  async function restaurerSauvegarde() {
+    try {
+      Module.FS.mkdir(SAUVE);
+      Module.FS.mount(Module.IDBFS, {}, SAUVE);
+      await syncfs(true);
+      empreinte = empreinteSauvegarde();
+      log('sauvegarde : ' + (empreinte ? 'profil retrouvé (' + empreinte.split('|').length + ' fichiers)' : 'aucune, première partie'));
+      setInterval(() => { const e = empreinteSauvegarde(); if (e !== empreinte) { empreinte = e; syncfs(false); } }, 2000);
+      const auRevoir = () => { if (empreinteSauvegarde() !== empreinte) { empreinte = empreinteSauvegarde(); syncfs(false); } };
+      addEventListener('pagehide', auRevoir);
+      // Onglet caché = appli Android en arrière-plan : le jeu écrit alors son profil (rt/sdl.c).
+      document.addEventListener('visibilitychange', () => {
+        const cache = document.visibilityState === 'hidden';
+        if (Module._recomp_web_arriere_plan) Module._recomp_web_arriere_plan(cache ? 1 : 0);
+        if (cache) setTimeout(auRevoir, 300);
+      });
+    } catch (e) { log('sauvegarde indisponible : ' + e); }
+  }
+
+  const pret = new Promise(ok => { Module.onRuntimeInitialized = ok; });
+  Promise.all([telecharger('bbr_jeu.zip'), pret]).then(([paquet]) => {
+    Module.FS.writeFile('/bbr_jeu.zip', paquet);
+    Module.FS.mkdir('/data');
+    Module.FS.chdir('/data');
+    return restaurerSauvegarde().then(() => paquet);
+  }).then(() => {
+    plein.style.width = '100%';
+    texte.textContent = 'Prêt.';
+    jouer.hidden = false;
+    if (P.has('auto')) jouer.click();
+  }).catch(e => { texte.textContent = 'Échec du chargement : ' + e.message; log(String(e)); });
+
+  // Écran maintenu allumé pendant le jeu (repris au retour sur l'onglet).
+  let verrou = null;
+  const garderEcran = async () => { try { if ('wakeLock' in navigator && document.visibilityState === 'visible') verrou = await navigator.wakeLock.request('screen'); } catch (e) {} };
+  document.addEventListener('visibilitychange', () => { if (document.body.classList.contains('jeu') && document.visibilityState === 'visible') garderEcran(); });
+  const estAppli = matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches;
+  jouer.onclick = () => {
+    document.body.classList.add('jeu');
+    garderEcran();
+    // Sur téléphone (hors appli installée) : plein écran et paysage, comme le jeu Android.
+    if (!estAppli && matchMedia('(pointer: coarse)').matches && document.documentElement.requestFullscreen)
+      document.documentElement.requestFullscreen({ navigationUI: 'hide' })
+        .then(() => screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape').catch(() => {}))
+        .catch(() => {});
+    const env = (P.get('env') || '').split(',').filter(Boolean);
+    // 1er argument : où lire les .so ; 2e : où lire les assets. Les deux sont dans le paquet.
+    Module.callMain(['/bbr_jeu.zip', '/bbr_jeu.zip', ...env]);
+  };
+</script>
+<script src="bbr.js"></script>
+</body>
+</html>

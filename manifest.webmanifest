@@ -1,0 +1,20 @@
+{
+  "name": "Beach Buggy Racing",
+  "short_name": "Beach Buggy",
+  "description": "Beach Buggy Racing (version Android d'origine) dans le navigateur",
+  "lang": "fr",
+  "start_url": "./",
+  "scope": "./",
+  "display": "fullscreen",
+  "display_override": ["fullscreen", "standalone"],
+  "orientation": "landscape",
+  "background_color": "#0b2533",
+  "theme_color": "#0b2533",
+  "categories": ["games"],
+  "icons": [
+    { "src": "icone.svg", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "icone-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icone-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icone-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

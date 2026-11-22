@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Icône originale (pas d'image du jeu) : soleil, mer, sable et drapeau à damier. -->
+  <rect width="512" height="512" fill="#1d8fd8"/>
+  <circle cx="370" cy="150" r="70" fill="#ffd34a"/>
+  <path d="M0 300 Q128 270 256 300 T512 300 V512 H0Z" fill="#0f6aa8"/>
+  <path d="M0 370 Q160 330 320 365 T512 360 V512 H0Z" fill="#f2c878"/>
+  <rect x="120" y="120" width="12" height="270" rx="6" fill="#3a2a1a"/>
+  <g transform="translate(132 128)">
+    <rect width="150" height="100" fill="#fff"/>
+    <g fill="#111">
+      <rect x="0" y="0" width="25" height="25"/><rect x="50" y="0" width="25" height="25"/><rect x="100" y="0" width="25" height="25"/>
+      <rect x="25" y="25" width="25" height="25"/><rect x="75" y="25" width="25" height="25"/><rect x="125" y="25" width="25" height="25"/>
+      <rect x="0" y="50" width="25" height="25"/><rect x="50" y="50" width="25" height="25"/><rect x="100" y="50" width="25" height="25"/>
+      <rect x="25" y="75" width="25" height="25"/><rect x="75" y="75" width="25" height="25"/><rect x="125" y="75" width="25" height="25"/>
+    </g>
+  </g>
+</svg>

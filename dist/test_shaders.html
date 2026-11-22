@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Test des shaders</title>
+<style>
+  body { background:#0b2533; color:#f2f7fa; font:13px/1.4 ui-monospace, monospace; margin:16px; }
+  pre { white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<pre id="sortie">Compilation…</pre>
+<script>
+// Compile chaque paire (vs, fs) des matériaux du jeu (shaders.json, extrait par
+// web/tools/extraire_shaders.py) dans un contexte WebGL 2, comme le ferait le jeu.
+(async () => {
+  const out = document.getElementById('sortie');
+  const S = await (await fetch('shaders.json')).json();
+  const gl = document.createElement('canvas').getContext('webgl2');
+  // En-tête ajouté par le jeu (libmain 0x62ba54) : version ES3 pour les sources 3 et 4 d'un bloc,
+  // puis la précision par défaut.
+  const entete = (type, es3) => (es3 ? '#version 300 es\n' : '') +
+    (type === 'vs' ? 'precision highp float;\n' : 'precision mediump float;\n');
+  const comp = (type, src, es3) => {
+    src = entete(type, es3) + src;
+    const sh = gl.createShader(type === 'vs' ? gl.VERTEX_SHADER : gl.FRAGMENT_SHADER);
+    gl.shaderSource(sh, src); gl.compileShader(sh);
+    return [sh, gl.getShaderParameter(sh, gl.COMPILE_STATUS) ? '' : gl.getShaderInfoLog(sh)];
+  };
+  const echecs = [], messages = {};
+  let paires = 0;
+  for (let k = 0; k + 1 < S.length; k++) {
+    const a = S[k], b = S[k + 1];
+    if (a.type !== 'vs' || b.type !== 'fs' || a.nom !== b.nom || a.bloc !== b.bloc) continue;
+    paires++;
+    const es3 = a.i >= 2;
+    const [vs, ev] = comp('vs', a.source, es3), [fs, ef] = comp('fs', b.source, es3);
+    let el = '';
+    if (!ev && !ef) {
+      const p = gl.createProgram(); gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) el = gl.getProgramInfoLog(p);
+      gl.deleteProgram(p);
+    }
+    gl.deleteShader(vs); gl.deleteShader(fs);
+    if (ev || ef || el) {
+      const m = (ev ? 'VS: ' + ev : '') + (ef ? 'FS: ' + ef : '') + (el ? 'LIEN: ' + el : '');
+      echecs.push({ nom: a.nom, bloc: a.bloc, i: a.i, m: m.trim(), vs: entete('vs', es3) + a.source, fs: entete('fs', es3) + b.source });
+      const cle = m.replace(/\d+:\d+/g, '').trim().slice(0, 160);
+      messages[cle] = (messages[cle] || 0) + 1;
+    }
+  }
+  const lignes = [`${paires} paires compilées, ${echecs.length} en échec`, '', 'Messages (nombre) :'];
+  for (const [m, n] of Object.entries(messages).sort((x, y) => y[1] - x[1])) lignes.push(`  ${n} × ${m}`);
+  lignes.push('', 'LavaFire :');
+  for (const e of echecs.filter(e => /LavaFire/.test(e.nom))) lignes.push(`  bloc ${e.bloc} #${e.i} : ${e.m}`);
+  out.textContent = lignes.join('\n');
+  window.resultat = { paires, echecs };
+})();
+</script>
+</body>
+</html>
