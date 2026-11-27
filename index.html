@@ -23,7 +23,11 @@
   #texte { min-height:1.5em; opacity:.85; }
   button { background:var(--accent); color:#222; border:0; border-radius:10px; padding:14px 40px;
            font-size:20px; font-weight:800; cursor:pointer; }
-  button[hidden] { display:none; }
+  button[hidden], #import[hidden] { display:none; }
+  #maj { background:transparent; border:2px solid var(--accent); color:var(--texte);
+         padding:8px 24px; font-size:15px; font-weight:600; border-radius:8px; margin-top:-6px; cursor:pointer; transition:background .2s; }
+  #maj:hover { background:rgba(255,180,58,.18); }
+  #import p { max-width:520px; margin:0 0 14px; opacity:.9; }
   canvas { position:fixed; inset:0; width:100vw; height:100vh; display:none; background:#000;
            touch-action:none; user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; outline:none; }
   body.jeu canvas { display:block; }
@@ -40,6 +44,13 @@
   <div id="barre"><div id="plein"></div></div>
   <div id="texte">Chargement…</div>
   <button id="jouer" hidden>Jouer</button>
+  <button id="maj" hidden>Mettre à jour</button>
+  <div id="import" hidden>
+    <p>Importez <b>bbr_code.zip</b> (~15 Mo) ; les données se téléchargent toutes seules.<br>
+       Si le téléchargement automatique est indisponible, vous pouvez aussi importer <b>bbr_donnees.zip</b> (~80 Mo) ou l'ancien <b>bbr_navigateur.zip</b>.</p>
+    <button id="importer">Importer le jeu</button>
+    <input id="fichier" type="file" multiple accept=".zip,.wasm,.js" hidden>
+  </div>
 </div>
 <pre id="etat"></pre>
 <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
@@ -49,9 +60,26 @@
   const P = new URLSearchParams(location.search);
   if (P.has('journal')) document.body.classList.add('journal');
   const etat = document.getElementById('etat'), plein = document.getElementById('plein'),
-        texte = document.getElementById('texte'), jouer = document.getElementById('jouer');
-  const log = (t) => { etat.textContent = (etat.textContent + t + '\n').slice(-20000); etat.scrollTop = 1e9; console.log(t); };
-  if (!crossOriginIsolated) texte.textContent = 'Serveur sans COOP/COEP : le jeu ne peut pas démarrer.';
+        texte = document.getElementById('texte'), jouer = document.getElementById('jouer'),
+        maj = document.getElementById('maj');
+  const log = (t) => { etat.textContent = (etat.textContent + t + '\n').slice(-20000); etat.scrollTop = 1e9; console.log(t); if (rapport) rapport.push(t); };
+  // ?rapport : le journal est aussi envoyé (POST /rapport, toutes les secondes) au serveur qui sert la
+  // page, pour déboguer un navigateur sans outils (Safari/iPhone, WebKit de test).
+  const rapport = P.has('rapport') ? [] : null;
+  if (rapport) {
+    setInterval(() => { if (rapport.length) fetch('rapport', { method: 'POST', body: rapport.splice(0).join('\n') }).catch(() => {}); }, 1000);
+    addEventListener('error', e => rapport.push('### erreur : ' + e.message + ' @ ' + e.filename + ':' + e.lineno + ':' + e.colno + '\n' + (e.error && e.error.stack)));
+    addEventListener('unhandledrejection', e => rapport.push('### promesse rejetée : ' + (e.reason && (e.reason.stack || e.reason))));
+  }
+  // Threads WebAssembly = page « isolée » (en-têtes COOP/COEP). Sur un hébergement qui ne les
+  // envoie pas (GitHub Pages), le service worker sw.js les ajoute : 1re visite -> on recharge une fois.
+  if (!crossOriginIsolated && 'serviceWorker' in navigator && !sessionStorage.getItem('bbr-isolation')) {
+    sessionStorage.setItem('bbr-isolation', '1');
+    navigator.serviceWorker.register('sw.js').then(() => navigator.serviceWorker.ready).then(() => location.reload());
+    throw new Error('rechargement pour l\'isolation');
+  }
+  sessionStorage.removeItem('bbr-isolation');
+  if (!crossOriginIsolated) texte.textContent = 'Page non isolée (COOP/COEP) : le jeu ne peut pas démarrer.';
 
   var Module = { canvas: document.getElementById('canvas'), print: log, printErr: log };
 
@@ -137,6 +165,66 @@
     } catch (e) { log('son indisponible : ' + e); }
   };
 
+  // Réseau du mode EN LIGNE : le module LAN croit parler UDP ; ses datagrammes passent par deux
+  // anneaux en mémoire partagée (rt/bionic_b_net.c) qu'un Worker à part vide et remplit, avec un
+  // WebSocket par adresse visée (ws://<relais>:47801, passerelle work/server/bbr_ws_pont.py).
+  // Un Worker et non le fil principal : celui-ci est pris par le jeu et ne tourne qu'entre deux images.
+  const RESEAU_WORKER = `
+    onmessage = (ev) => {
+      const { buf, so, sn, sw, sr, eo, en, ew, er, port } = ev.data;
+      const U8 = new Uint8Array(buf), U32 = new Int32Array(buf);
+      const prises = new Map();          // 'a.b.c.d' -> { ws, attente: [], essai }
+      const stats = { tx: 0, rx: 0, perdus: 0 };
+      const entree = (ip4, port2, data) => {   // vers le jeu
+        const e = Atomics.load(U32, ew / 4) >>> 0, l = Atomics.load(U32, er / 4) >>> 0;
+        const tot = data.length + 8;
+        if (en - ((e - l) >>> 0) < tot) { stats.perdus++; return; }
+        const h = [tot & 255, tot >> 8, ...ip4, ...port2];
+        for (let k = 0; k < 8; k++) U8[eo + (e + k) % en] = h[k];
+        for (let k = 0; k < data.length; k++) U8[eo + (e + 8 + k) % en] = data[k];
+        Atomics.store(U32, ew / 4, (e + tot) | 0); stats.rx++;
+      };
+      const prise = (ip, ip4, port2) => {
+        let p = prises.get(ip);
+        if (p && p.ws.readyState <= 1) return p;
+        if (p && Date.now() - p.essai < 1000) return null;   // reconnexion au plus 1 fois/s
+        // Relais d'aiko : nom de domaine avec certificat (Caddy :443 -> bbr_ws_pont.py), seul moyen
+        // d'ouvrir un wss:// depuis une page HTTPS (Netlify). Ailleurs (essais locaux) : ip:47801.
+        const ws = new WebSocket(ip === '13.140.204.188' ? 'wss://bbr.woop.dpdns.org/'
+          : (self.location.protocol === 'https:' ? 'wss://' : 'ws://') + ip + ':' + port + '/');
+        ws.binaryType = 'arraybuffer';
+        p = { ws, attente: [], essai: Date.now() };
+        ws.onopen = () => { postMessage('connecté à ' + ip + ':' + port); for (const m of p.attente) ws.send(m); p.attente = []; };
+        ws.onmessage = (m) => entree(ip4, port2, new Uint8Array(m.data));
+        ws.onclose = () => postMessage('fermé : ' + ip + ':' + port);
+        prises.set(ip, p);
+        return p;
+      };
+      setInterval(() => {
+        let l = Atomics.load(U32, sr / 4) >>> 0;
+        const e = Atomics.load(U32, sw / 4) >>> 0;
+        while (l !== e) {
+          const tot = U8[so + l % sn] | U8[so + (l + 1) % sn] << 8;
+          const m = new Uint8Array(tot);
+          for (let k = 0; k < tot; k++) m[k] = U8[so + (l + k) % sn];
+          l = (l + tot) >>> 0;
+          const ip4 = m.subarray(2, 6), port2 = m.subarray(6, 8), data = m.slice(8);
+          const p = prise(ip4.join('.'), [...ip4], [...port2]);
+          if (!p) { stats.perdus++; continue; }
+          if (p.ws.readyState === 1) p.ws.send(data); else p.attente.push(data);
+          stats.tx++;
+        }
+        Atomics.store(U32, sr / 4, l | 0);
+      }, 2);
+      setInterval(() => postMessage({ stats }), 5000);
+    };`;
+  Module.reseauDemarrer = (buf, so, sn, sw, sr, eo, en, ew, er, port) => {
+    const w = new Worker(URL.createObjectURL(new Blob([RESEAU_WORKER], { type: 'text/javascript' })));
+    w.onmessage = (m) => { if (typeof m.data === 'string') log('réseau : ' + m.data); else Module.reseauStats = m.data.stats; };
+    w.postMessage({ buf, so, sn, sw, sr, eo, en, ew, er, port });
+    Module.reseau = w; log('réseau : passerelle WebSocket prête');
+  };
+
   // Sauvegarde du joueur : le jeu écrit son profil dans /data/bbr_data (système de fichiers en
   // mémoire, perdu au rechargement). On monte ce dossier sur IndexedDB (IDBFS) : rechargé avant le
   // lancement, recopié dès qu'un fichier y change (vérification toutes les 2 s) et à la sortie.
@@ -145,11 +233,95 @@
   let empreinte = '';
   const empreinteSauvegarde = () => { try { return Module.FS.readdir(SAUVE).filter(f => f[0] !== '.')
       .map(f => { const s = Module.FS.stat(SAUVE + '/' + f); return f + ':' + s.size + ':' + (+s.mtime); }).join('|'); } catch (e) { return ''; } };
+  // Didacticiel de départ (3 courses d'initiation) sauté : le jeu le retient dans son profil
+  // (/data/bbr_data/profile, « RPUV » + arbre binaire « VUJB » gros-boutiste), clés
+  // PersistentCloudData/TutorialCompleted01..03 et ScreensTutorialViewed. On les met à vrai dans le
+  // profil existant, ou on crée un profil qui ne contient qu'elles (le jeu complète le reste). Le
+  // consentement aux conditions d'utilisation n'est PAS touché : chaque joueur l'accepte lui-même.
+  // ?tutoriel garde le didacticiel.
+  const DIDACTICIEL = ['TutorialCompleted01', 'TutorialCompleted02', 'TutorialCompleted03', 'ScreensTutorialViewed'];
+  const vujbLire = (u8) => {
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength); let i = 0;
+    const u32 = () => { const v = dv.getUint32(i); i += 4; return v; };
+    const txt = () => { const n = u32(); const v = new TextDecoder().decode(u8.subarray(i, i + n)); i += n; return v; };
+    const val = () => {
+      const t = u32();
+      switch (t) {
+        case 0: return { t };
+        case 1: return { t, v: dv.getInt32((i += 4) - 4) };
+        case 2: return { t, v: dv.getFloat32((i += 4) - 4) };
+        case 3: return { t, v: u8[i++] };
+        case 4: return { t, v: txt() };
+        case 5: { const n = u32(), v = []; for (let k = 0; k < n; k++) v.push(val()); return { t, v }; }
+        case 6: { const n = u32(), v = []; for (let k = 0; k < n; k++) { const c = txt(); v.push([c, val()]); } return { t, v }; }
+        case 7: return { t, v: u8.slice((i += 8) - 8, i) };
+        default: throw new Error('type ' + t);
+      }
+    };
+    const r = val(); if (i !== u8.length) throw new Error('reste ' + (u8.length - i)); return r;
+  };
+  const vujbEcrire = (r) => {
+    const morceaux = []; const enc = new TextEncoder();
+    const u32 = (v) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v); morceaux.push(b); };
+    const txt = (s) => { const b = enc.encode(s); u32(b.length); morceaux.push(b); };
+    const val = (x) => {
+      u32(x.t);
+      if (x.t === 1) { const b = new Uint8Array(4); new DataView(b.buffer).setInt32(0, x.v); morceaux.push(b); }
+      else if (x.t === 2) { const b = new Uint8Array(4); new DataView(b.buffer).setFloat32(0, x.v); morceaux.push(b); }
+      else if (x.t === 3) morceaux.push(Uint8Array.of(x.v ? 1 : 0));
+      else if (x.t === 4) txt(x.v);
+      else if (x.t === 5) { u32(x.v.length); x.v.forEach(val); }
+      else if (x.t === 6) { u32(x.v.length); for (const [c, y] of x.v) { txt(c); val(y); } }
+      else if (x.t === 7) morceaux.push(x.v);
+    };
+    val(r);
+    const out = new Uint8Array(morceaux.reduce((a, b) => a + b.length, 0)); let i = 0;
+    for (const b of morceaux) { out.set(b, i); i += b.length; }
+    return out;
+  };
+  const fnv1a32 = (u8) => { let h = 0x811c9dc5; for (const b of u8) h = Math.imul(h ^ b, 0x01000193) >>> 0; return h; };
+  function sauterDidacticiel() {
+    if (P.has('tutoriel')) return 0;
+    const F = Module.FS, chemin = SAUVE + '/profile';
+    let entete = Uint8Array.of(0x52, 0x50, 0x55, 0x56, 1, 0, 0, 0), arbre = { t: 6, v: [] };
+    try {
+      const d = F.readFile(chemin);
+      const dv = new DataView(d.buffer, d.byteOffset, d.byteLength);
+      const n = dv.getUint32(8, true);
+      if (String.fromCharCode(...d.subarray(0, 4)) !== 'RPUV' || n !== d.length - 16 || fnv1a32(d.subarray(16)) !== dv.getUint32(12, true)
+          || String.fromCharCode(...d.subarray(16, 20)) !== 'VUJB') { log('didacticiel : profil illisible, laissé tel quel'); return 0; }
+      entete = d.slice(0, 8);
+      arbre = vujbLire(d.subarray(24));
+    } catch (e) {
+      if (!(e && e.errno === 44)) { log('didacticiel : profil illisible (' + e + '), laissé tel quel'); return 0; }   // 44 = ENOENT : pas encore de profil
+    }
+    if (arbre.t !== 6) return 0;
+    let pcd = arbre.v.find(([c]) => c === 'PersistentCloudData');
+    if (!pcd) arbre.v.push(pcd = ['PersistentCloudData', { t: 6, v: [] }]);
+    let change = 0;
+    for (const cle of DIDACTICIEL) {
+      const e = pcd[1].v.find(([c]) => c === cle);
+      if (!e) { pcd[1].v.push([cle, { t: 3, v: 1 }]); change++; }
+      else if (e[1].t !== 3 || !e[1].v) { e[1] = { t: 3, v: 1 }; change++; }
+    }
+    if (!change) return 0;
+    const vujb = vujbEcrire(arbre);
+    const corps = new Uint8Array(8 + vujb.length);
+    corps.set([0x56, 0x55, 0x4a, 0x42, 0, 0, 0, 1]); corps.set(vujb, 8);
+    const d = new Uint8Array(16 + corps.length);
+    d.set(entete); d.set(corps, 16);
+    const dv = new DataView(d.buffer); dv.setUint32(8, corps.length, true); dv.setUint32(12, fnv1a32(corps), true);
+    for (const f of ['profile', 'profileback']) F.writeFile(SAUVE + '/' + f, d);
+    log('didacticiel de départ : sauté (' + change + ' marqueur' + (change > 1 ? 's' : '') + ' ajouté' + (change > 1 ? 's' : '') + ')');
+    return change;
+  }
+
   async function restaurerSauvegarde() {
     try {
       Module.FS.mkdir(SAUVE);
       Module.FS.mount(Module.IDBFS, {}, SAUVE);
       await syncfs(true);
+      try { if (sauterDidacticiel()) await syncfs(false); } catch (e) { log('didacticiel : ' + e); }
       empreinte = empreinteSauvegarde();
       log('sauvegarde : ' + (empreinte ? 'profil retrouvé (' + empreinte.split('|').length + ' fichiers)' : 'aucune, première partie'));
       setInterval(() => { const e = empreinteSauvegarde(); if (e !== empreinte) { empreinte = e; syncfs(false); } }, 2000);
@@ -164,18 +336,505 @@
     } catch (e) { log('sauvegarde indisponible : ' + e); }
   }
 
+  // Deux façons d'avoir le jeu :
+  //  - serveur local (web/serve.py) : bbr.js, bbr.wasm et bbr_jeu.zip sont servis ;
+  //  - site sans le jeu (Cloudflare Pages, GitHub Pages) : les données (bbr_donnees.zip, ~80 Mo) se
+  //    téléchargent toutes seules par morceaux (GET /donnees) avec reprise, tandis que le joueur importe
+  //    bbr_code.zip (~15 Mo). En cas d'indisponibilité du serveur de données, l'import manuel de
+  //    bbr_donnees.zip reste possible. Les parties sont rangées dans le cache « bbr-paquet » et le paquet
+  //    bbr_jeu.zip est reconstruit en mémoire aux lancements suivants.
   const pret = new Promise(ok => { Module.onRuntimeInitialized = ok; });
-  Promise.all([telecharger('bbr_jeu.zip'), pret]).then(([paquet]) => {
+
+  const tableCrc = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    tableCrc[i] = c >>> 0;
+  }
+  function crc32(u8) {
+    let c = 0xffffffff;
+    for (let i = 0; i < u8.length; i++) c = tableCrc[(c ^ u8[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  }
+
+  // Décompresse une entrée de zip si nécessaire (méthode 8 deflate ou 0 sans compression).
+  async function contenu(entree) {
+    if (entree.methode === 8) {
+      return new Response(entree.blob.stream().pipeThrough(new DecompressionStream('deflate-raw'))).blob();
+    }
+    return entree.blob;
+  }
+
+  // Lecture des entrées d'un zip (STORED méthode 0 ou DEFLATE méthode 8) sans tout charger en mémoire.
+  async function lireZip(f) {
+    const n = f.size, fin = new DataView(await f.slice(Math.max(0, n - 65557)).arrayBuffer());
+    let k = fin.byteLength - 22;
+    while (k >= 0 && fin.getUint32(k, true) !== 0x06054b50) k--;
+    if (k < 0) throw new Error((f.name || 'archive') + " n'est pas un zip");
+    const nb = fin.getUint16(k + 10, true), taille = fin.getUint32(k + 12, true), debut = fin.getUint32(k + 16, true);
+    const cd = new DataView(await f.slice(debut, debut + taille).arrayBuffer());
+    const sortie = new Map();
+    for (let i = 0, p = 0; i < nb; i++) {
+      const methode = cd.getUint16(p + 10, true),
+            crc = cd.getUint32(p + 16, true),
+            csz = cd.getUint32(p + 20, true),
+            tailleNonComp = cd.getUint32(p + 24, true),
+            nl = cd.getUint16(p + 28, true),
+            el = cd.getUint16(p + 30, true),
+            cl = cd.getUint16(p + 32, true),
+            off = cd.getUint32(p + 42, true);
+      const nom = new TextDecoder().decode(new Uint8Array(cd.buffer, p + 46, nl));
+      if (!nom.endsWith('/') && (methode === 0 || methode === 8)) {
+        const lh = new DataView(await f.slice(off, off + 30).arrayBuffer());
+        const d = off + 30 + lh.getUint16(26, true) + lh.getUint16(28, true);
+        sortie.set(nom, { blob: f.slice(d, d + csz), methode, taille: tailleNonComp, crc });
+      }
+      p += 46 + nl + el + cl;
+    }
+    return sortie;
+  }
+
+  // Reconstruit en mémoire un zip STORED « bbr_jeu.zip » à partir des fichiers du cache.
+  function construireZip(fichiers) {
+    const enc = new TextEncoder();
+    let tailleTotale = 22;
+    const entrees = [];
+    for (const f of fichiers) {
+      const nomBytes = enc.encode(f.nom);
+      const crc = (f.crc !== undefined ? f.crc : crc32(f.donnees)) >>> 0;
+      const size = f.donnees.length >>> 0;
+      entrees.push({ nom: f.nom, nomBytes, donnees: f.donnees, crc, size });
+      tailleTotale += 30 + nomBytes.length + size + 46 + nomBytes.length;
+    }
+    const buf = new Uint8Array(tailleTotale);
+    const dv = new DataView(buf.buffer);
+    let pos = 0;
+    for (const e of entrees) {
+      e.offset = pos;
+      dv.setUint32(pos, 0x04034b50, true);
+      dv.setUint16(pos + 4, 20, true);
+      dv.setUint16(pos + 6, 0, true);
+      dv.setUint16(pos + 8, 0, true);
+      dv.setUint16(pos + 10, 0, true);
+      dv.setUint16(pos + 12, 0, true);
+      dv.setUint32(pos + 14, e.crc, true);
+      dv.setUint32(pos + 18, e.size, true);
+      dv.setUint32(pos + 22, e.size, true);
+      dv.setUint16(pos + 26, e.nomBytes.length, true);
+      dv.setUint16(pos + 28, 0, true);
+      buf.set(e.nomBytes, pos + 30);
+      pos += 30 + e.nomBytes.length;
+      buf.set(e.donnees, pos);
+      pos += e.size;
+    }
+    const debutCd = pos;
+    for (const e of entrees) {
+      dv.setUint32(pos, 0x02014b50, true);
+      dv.setUint16(pos + 4, 20, true);
+      dv.setUint16(pos + 6, 20, true);
+      dv.setUint16(pos + 8, 0, true);
+      dv.setUint16(pos + 10, 0, true);
+      dv.setUint16(pos + 12, 0, true);
+      dv.setUint16(pos + 14, 0, true);
+      dv.setUint32(pos + 16, e.crc, true);
+      dv.setUint32(pos + 20, e.size, true);
+      dv.setUint32(pos + 24, e.size, true);
+      dv.setUint16(pos + 28, e.nomBytes.length, true);
+      dv.setUint16(pos + 30, 0, true);
+      dv.setUint16(pos + 32, 0, true);
+      dv.setUint16(pos + 34, 0, true);
+      dv.setUint16(pos + 36, 0, true);
+      dv.setUint32(pos + 38, 0, true);
+      dv.setUint32(pos + 42, e.offset, true);
+      buf.set(e.nomBytes, pos + 46);
+      pos += 46 + e.nomBytes.length;
+    }
+    const tailleCd = pos - debutCd;
+    dv.setUint32(pos, 0x06054b50, true);
+    dv.setUint16(pos + 4, 0, true);
+    dv.setUint16(pos + 6, 0, true);
+    dv.setUint16(pos + 8, entrees.length, true);
+    dv.setUint16(pos + 10, entrees.length, true);
+    dv.setUint32(pos + 12, tailleCd, true);
+    dv.setUint32(pos + 16, debutCd, true);
+    dv.setUint16(pos + 20, 0, true);
+    return buf;
+  }
+
+  const TYPES = { 'bbr.js': 'text/javascript', 'bbr.wasm': 'application/wasm', 'bbr_jeu.zip': 'application/zip' };
+  const ENTREES_JEU = [
+    'assets/Assets.apf',
+    'lib/arm64-v8a/libmain.so',
+    'lib/arm64-v8a/libc++_shared.so',
+    'lib/arm64-v8a/libfmod.so',
+    'lib/arm64-v8a/libfmodstudio.so',
+    'lib/arm64-v8a/libbbrlan.so'
+  ];
+  const JEU_OBLIGATOIRES = [
+    'assets/Assets.apf',
+    'lib/arm64-v8a/libmain.so',
+    'lib/arm64-v8a/libc++_shared.so',
+    'lib/arm64-v8a/libfmod.so',
+    'lib/arm64-v8a/libfmodstudio.so'
+  ];
+  const DONNEES_ENTREES = [
+    'assets/Assets.apf',
+    'lib/arm64-v8a/libc++_shared.so',
+    'lib/arm64-v8a/libfmod.so',
+    'lib/arm64-v8a/libfmodstudio.so'
+  ];
+
+  // sansEcraser : n'ajoute que les parties absentes (ancienne copie éclatée après un import de
+  // bbr_code.zip : ses libmain.so / libbbrlan.so, plus vieux, ne doivent pas remplacer les neufs).
+  async function rangerZip(z, cache, sansEcraser = false) {
+    if (z.has('bbr_jeu.zip')) {
+      const inner = await contenu(z.get('bbr_jeu.zip'));
+      const zj = await lireZip(inner);
+      await rangerZip(zj, cache, sansEcraser);
+    }
+    for (const [nom, entree] of z.entries()) {
+      if (nom === 'bbr_jeu.zip') continue;
+      const cle = (nom === 'bbr.js' || nom === 'bbr.wasm') ? 'import/' + nom : 'import/jeu/' + nom;
+      if (sansEcraser && await cache.match(cle)) continue;
+      const blob = await contenu(entree);
+      if (nom === 'bbr.js' || nom === 'bbr.wasm') {
+        await cache.put('import/' + nom, new Response(blob, {
+          headers: { 'Content-Type': TYPES[nom], 'Content-Length': String(blob.size) }
+        }));
+      } else {
+        const headers = { 'Content-Type': 'application/octet-stream', 'Content-Length': String(blob.size) };
+        if (entree.crc !== undefined) headers['x-crc32'] = String(entree.crc >>> 0);
+        await cache.put('import/jeu/' + nom, new Response(blob, { headers }));
+      }
+    }
+  }
+
+  // Télécharge automatiquement les données du jeu (bbr_donnees.zip) par morceaux de 4 Mo avec reprise.
+  async function telechargerDonnees(cache) {
+    try {
+      let baseInfo;
+      try {
+        const r = await fetch('/donnees', { cache: 'no-store' });
+        if (!r.ok) { log('/donnees indisponible (' + r.status + ')'); return false; }
+        baseInfo = await r.json();
+      } catch (e) {
+        log('/donnees inaccessible (' + (e.message || e) + ')');
+        return false;
+      }
+      if (!baseInfo || !baseInfo.base) return false;
+      const base = baseInfo.base.endsWith('/') ? baseInfo.base : (baseInfo.base + '/');
+
+      const rVer = await fetch(base + 'version.json', { cache: 'no-store' });
+      if (!rVer.ok) { log('version.json indisponible (' + rVer.status + ')'); return false; }
+      const { fichier, taille, version } = await rVer.json();
+      if (!fichier || !taille || !version) { log('version.json invalide'); return false; }
+
+      const verRep = await cache.match('import/donnees-version');
+      const verGarde = verRep ? (await verRep.text()).trim() : '';
+      if (verGarde === version) {
+        let donneesCompletes = true;
+        for (const e of DONNEES_ENTREES) {
+          if (!await cache.match('import/jeu/' + e)) { donneesCompletes = false; break; }
+        }
+        if (donneesCompletes) return false;
+      }
+
+      const TAILLE_MORCEAU = 4 * 1024 * 1024;
+      const nbMorceaux = Math.ceil(taille / TAILLE_MORCEAU);
+      const urlFichier = base + fichier;
+      const morceaux = new Array(nbMorceaux);
+      let recu = 0;
+
+      // Morceaux déjà présents pour cette version (reprise après coupure)
+      for (let n = 0; n < nbMorceaux; n++) {
+        const a = n * TAILLE_MORCEAU;
+        const b = Math.min(taille - 1, a + TAILLE_MORCEAU - 1);
+        const attendu = b - a + 1;
+        const cle = `import/morceaux/${version}/${n}`;
+        const rep = await cache.match(cle);
+        if (rep) {
+          const blob = await rep.blob();
+          if (blob.size === attendu) {
+            morceaux[n] = blob;
+            recu += attendu;
+          } else {
+            await cache.delete(cle);
+          }
+        }
+      }
+
+      if (recu > 0) {
+        log(`données du jeu : reprise du téléchargement (${(recu / 1e6).toFixed(1)} / ${(taille / 1e6).toFixed(1)} Mo déjà en cache)`);
+      }
+      plein.style.width = (100 * recu / taille).toFixed(1) + '%';
+      texte.textContent = `Téléchargement des données du jeu : ${(recu / 1e6).toFixed(0)} / ${(taille / 1e6).toFixed(0)} Mo`;
+
+      for (let n = 0; n < nbMorceaux; n++) {
+        if (morceaux[n]) continue;
+        const a = n * TAILLE_MORCEAU;
+        const b = Math.min(taille - 1, a + TAILLE_MORCEAU - 1);
+        const attendu = b - a + 1;
+        const cle = `import/morceaux/${version}/${n}`;
+
+        let blob = null;
+        let dernierErr = null;
+        for (let essai = 1; essai <= 5; essai++) {
+          try {
+            const r = await fetch(urlFichier, {
+              headers: { 'Range': `bytes=${a}-${b}` },
+              cache: 'no-store'
+            });
+            if (r.status !== 206) throw new Error('statut ' + r.status + ' (206 attendu)');
+            const bRecu = await r.blob();
+            if (bRecu.size !== attendu) {
+              throw new Error(`longueur reçue ${bRecu.size} != ${attendu}`);
+            }
+            await cache.put(cle, new Response(bRecu, {
+              headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(attendu) }
+            }));
+            blob = bRecu;
+            recu += attendu;
+            plein.style.width = (100 * recu / taille).toFixed(1) + '%';
+            texte.textContent = `Téléchargement des données du jeu : ${(recu / 1e6).toFixed(0)} / ${(taille / 1e6).toFixed(0)} Mo`;
+            break;
+          } catch (e) {
+            dernierErr = e;
+            log(`morceau ${n + 1}/${nbMorceaux} (essai ${essai}/5) : ${e.message || e}`);
+            if (essai < 5) {
+              await new Promise(res => setTimeout(res, 1000 * (1 << (essai - 1))));
+            }
+          }
+        }
+        if (!blob) {
+          throw new Error(`échec du morceau ${n + 1}/${nbMorceaux} après 5 essais (${dernierErr ? dernierErr.message : ''})`);
+        }
+        morceaux[n] = blob;
+      }
+
+      const toutBlob = new Blob(morceaux);
+      if (toutBlob.size !== taille) {
+        throw new Error(`taille finale incorrecte : ${toutBlob.size} octets (${taille} attendus)`);
+      }
+      texte.textContent = 'Rangement des données du jeu…';
+      const z = await lireZip(toutBlob);
+      await rangerZip(z, cache);
+      await cache.put('import/donnees-version', new Response(version, {
+        headers: { 'Content-Type': 'text/plain', 'Content-Length': String(version.length) }
+      }));
+      const cles = await cache.keys();
+      for (const req of cles) {
+        if (req.url.includes('import/morceaux/')) await cache.delete(req);
+      }
+      await cache.delete('import/bbr_jeu.zip');      // ancienne copie complète : remplacée
+      log('données du jeu : version ' + version + ' installée');
+      return true;
+    } catch (e) {
+      log('téléchargement des données : ' + (e.message || e));
+      return false;
+    }
+  }
+
+  async function verifierManquants(cache) {
+    const manque = [];
+    const codeOk = (await cache.match('import/bbr.js'))
+                && (await cache.match('import/bbr.wasm'))
+                && (await cache.match('import/jeu/lib/arm64-v8a/libmain.so'));
+    if (!codeOk) manque.push('bbr_code.zip');
+
+    let donneesOk = true;
+    for (const n of DONNEES_ENTREES) {
+      if (!await cache.match('import/jeu/' + n)) { donneesOk = false; break; }
+    }
+    // Si l'ancien bbr_jeu.zip est en cache sans entrées éclatées, l'éclater
+    if (!donneesOk && await cache.match('import/bbr_jeu.zip')) {
+      const ancien = await cache.match('import/bbr_jeu.zip');
+      const z = await lireZip(await ancien.blob());
+      await rangerZip(z, cache, true);
+      await cache.delete('import/bbr_jeu.zip');
+      donneesOk = true;
+      for (const n of DONNEES_ENTREES) {
+        if (!await cache.match('import/jeu/' + n)) { donneesOk = false; break; }
+      }
+    }
+    if (!donneesOk) manque.push('bbr_donnees.zip');
+    return manque;
+  }
+
+  async function actualiserAideImport(cache) {
+    const p = document.querySelector('#import p');
+    if (!p) return;
+    const manque = await verifierManquants(cache);
+    if (manque.length === 1 && manque[0] === 'bbr_code.zip') {
+      p.innerHTML = 'Importez <b>bbr_code.zip</b> ; les données se téléchargent toutes seules.';
+    } else {
+      p.innerHTML = 'Importez <b>bbr_code.zip</b> (~15 Mo) ; les données se téléchargent toutes seules.<br>' +
+        'Si le téléchargement automatique est indisponible, vous pouvez aussi importer <b>bbr_donnees.zip</b> (~80 Mo) ou l\'ancien <b>bbr_navigateur.zip</b>.';
+    }
+  }
+
+  async function importer(cache) {
+    document.getElementById('import').hidden = false;
+    await actualiserAideImport(cache);
+    const manqueInit = await verifierManquants(cache);
+    texte.textContent = (manqueInit.length === 1 && manqueInit[0] === 'bbr_code.zip')
+      ? 'Code du jeu à importer.'
+      : 'Jeu à importer.';
+    const fichier = document.getElementById('fichier');
+    document.getElementById('importer').onclick = () => fichier.click();
+    return new Promise(ok => {
+      fichier.onchange = async () => {
+        try {
+          texte.textContent = 'Rangement du jeu dans le navigateur…';
+          for (const f of fichier.files) {
+            if (f.name.endsWith('.wasm')) {
+              await cache.put('import/bbr.wasm', new Response(f, {
+                headers: { 'Content-Type': TYPES['bbr.wasm'], 'Content-Length': String(f.size) }
+              }));
+            } else if (f.name.endsWith('.js')) {
+              await cache.put('import/bbr.js', new Response(f, {
+                headers: { 'Content-Type': TYPES['bbr.js'], 'Content-Length': String(f.size) }
+              }));
+            } else {
+              const z = await lireZip(f);
+              await rangerZip(z, cache);
+            }
+          }
+          fichier.value = '';
+          let manque = await verifierManquants(cache);
+          if (manque.includes('bbr_donnees.zip')) {
+            await telechargerDonnees(cache);
+            manque = await verifierManquants(cache);
+          }
+          if (manque.length) {
+            texte.textContent = 'Il manque : ' + manque.join(', ');
+            await actualiserAideImport(cache);
+            return;
+          }
+          log('jeu importé : toutes les parties nécessaires sont enregistrées');
+          document.getElementById('import').hidden = true;
+          ok();
+        } catch (e) {
+          texte.textContent = 'Import impossible : ' + e.message;
+          log('import erreur : ' + e);
+          fichier.value = '';
+        }
+      };
+    });
+  }
+
+  const chargerScript = (src) => new Promise((ok, ko) => {
+    const s = document.createElement('script'); s.src = src; s.onload = ok; s.onerror = () => ko(new Error('script ' + src));
+    document.body.appendChild(s);
+  });
+
+  async function cacheEstPret(cache) {
+    if (!await cache.match('import/bbr.js') || !await cache.match('import/bbr.wasm')) return false;
+    // Ancien format : import/bbr_jeu.zip sans entrées éclatées
+    const aEclate = await cache.match('import/jeu/assets/Assets.apf');
+    if (!aEclate && await cache.match('import/bbr_jeu.zip')) return true;
+    for (const n of JEU_OBLIGATOIRES) {
+      if (!await cache.match('import/jeu/' + n)) return false;
+    }
+    return true;
+  }
+
+  async function demarrer() {
+    const serveur = await fetch('bbr.js', { method: 'HEAD', cache: 'no-store' }).then(r => r.ok).catch(() => false);
+    const cache = await caches.open(CACHE_PAQUET);
+    if (!serveur) {
+      await telechargerDonnees(cache);
+    }
+    const pretCache = !P.has('importer') && await cacheEstPret(cache);
+    let importe = !serveur && pretCache;
+    // hors ligne avec la version servie en local : copies du service worker
+    const horsLigne = !serveur && !importe && !P.has('importer') && await caches.match('bbr.js');
+    if (P.has('importer') || (!serveur && !importe && !horsLigne)) {
+      await importer(cache);
+      importe = true;
+    }
+    let paquet;
+    if (importe) {
+      const url = async (n) => URL.createObjectURL(new Blob([await (await cache.match('import/' + n)).blob()], { type: TYPES[n] }));
+      const wasm = await url('bbr.wasm');
+      Module.locateFile = (chemin) => chemin.endsWith('.wasm') ? wasm : chemin;
+      await chargerScript(await url('bbr.js'));
+      const ancien = !await cache.match('import/jeu/assets/Assets.apf') && await cache.match('import/bbr_jeu.zip');
+      if (ancien) {
+        paquet = await lireAvecProgression(ancien, 'Lecture du jeu');
+      } else {
+        const liste = [];
+        for (const nom of ENTREES_JEU) {
+          const rep = await cache.match('import/jeu/' + nom);
+          if (rep) liste.push({ nom, rep });
+        }
+        const fichiers = [];
+        for (const { nom, rep } of liste) {
+          let donnees;
+          if (nom === 'assets/Assets.apf') {
+            donnees = await lireAvecProgression(rep, 'Lecture du jeu');
+          } else {
+            donnees = new Uint8Array(await rep.arrayBuffer());
+          }
+          const crcEntete = rep.headers.get('x-crc32');
+          const crc = crcEntete !== null ? (+crcEntete >>> 0) : crc32(donnees);
+          fichiers.push({ nom, donnees, crc });
+        }
+        texte.textContent = 'Préparation du jeu…';
+        paquet = construireZip(fichiers);
+      }
+      log('jeu : copie importée dans ce navigateur');
+    } else {
+      await chargerScript('bbr.js');
+      paquet = await telecharger('bbr_jeu.zip');
+    }
+    await pret;
     Module.FS.writeFile('/bbr_jeu.zip', paquet);
     Module.FS.mkdir('/data');
     Module.FS.chdir('/data');
-    return restaurerSauvegarde().then(() => paquet);
-  }).then(() => {
+    await restaurerSauvegarde();
     plein.style.width = '100%';
     texte.textContent = 'Prêt.';
     jouer.hidden = false;
+    maj.hidden = false;
     if (P.has('auto')) jouer.click();
-  }).catch(e => { texte.textContent = 'Échec du chargement : ' + e.message; log(String(e)); });
+  }
+  demarrer().catch(e => { texte.textContent = 'Échec du chargement : ' + e.message; log(String(e)); });
+
+  maj.onclick = () => {
+    const f = document.getElementById('fichier');
+    f.onchange = async () => {
+      try {
+        texte.textContent = 'Mise à jour en cours…';
+        plein.style.width = '30%';
+        jouer.hidden = true;
+        maj.hidden = true;
+        const cache = await caches.open(CACHE_PAQUET);
+        for (const file of f.files) {
+          if (file.name.endsWith('.wasm')) {
+            await cache.put('import/bbr.wasm', new Response(file, {
+              headers: { 'Content-Type': TYPES['bbr.wasm'], 'Content-Length': String(file.size) }
+            }));
+          } else if (file.name.endsWith('.js')) {
+            await cache.put('import/bbr.js', new Response(file, {
+              headers: { 'Content-Type': TYPES['bbr.js'], 'Content-Length': String(file.size) }
+            }));
+          } else {
+            const z = await lireZip(file);
+            await rangerZip(z, cache);
+          }
+        }
+        f.value = '';
+        plein.style.width = '100%';
+        texte.textContent = 'Mise à jour installée ! Rechargement…';
+        setTimeout(() => location.reload(), 600);
+      } catch (e) {
+        texte.textContent = 'Erreur mise à jour : ' + e.message;
+        jouer.hidden = false;
+        maj.hidden = false;
+      }
+    };
+    f.click();
+  };
 
   // Écran maintenu allumé pendant le jeu (repris au retour sur l'onglet).
   let verrou = null;
@@ -195,6 +854,5 @@
     Module.callMain(['/bbr_jeu.zip', '/bbr_jeu.zip', ...env]);
   };
 </script>
-<script src="bbr.js"></script>
 </body>
 </html>
